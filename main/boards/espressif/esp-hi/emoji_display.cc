@@ -126,12 +126,12 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
     static constexpr EmotionMapping emotion_map[] = {
         {"happy", "happy_loop", true, 25},       {"laughing", "happy_loop", true, 25},
         {"funny", "happy_loop", true, 25},       {"loving", "happy_loop", true, 25},
-        {"embarrassed", "happy_loop", true, 25}, {"confident", "happy_loop", true, 25},
+        {"embarrassed", "panic_loop", true, 25}, {"confident", "happy_loop", true, 25},
         {"delicious", "happy_loop", true, 25},   {"sad", "sad_loop", true, 25},
         {"crying", "sad_loop", true, 25},        {"sleepy", "sad_loop", true, 25},
-        {"silly", "sad_loop", true, 25},         {"angry", "anger_loop", true, 25},
+        {"silly", "happy_loop", true, 25},         {"angry", "anger_loop", true, 25},
         {"surprised", "panic_loop", true, 25},   {"shocked", "panic_loop", true, 25},
-        {"thinking", "happy_loop", true, 25},    {"winking", "blink_quick", true, 5},
+        {"thinking", "scorn_loop", true, 25},    {"winking", "blink_quick", true, 5},
         {"relaxed", "scorn_loop", true, 25},     {"confused", "scorn_loop", true, 25},
     };
 
