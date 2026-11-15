@@ -24,6 +24,8 @@
 #include "led_strip.h"
 #include "driver/rmt_tx.h"
 #include "device_state.h"
+#include <esp_timer.h>
+#include <esp_system.h>
 
 #include "sdkconfig.h"
 
@@ -99,6 +101,7 @@ private:
     bool web_server_initialized_ = false;
     led_strip_handle_t led_strip_;
     bool led_on_ = false;
+    esp_timer_handle_t idle_anim_timer_ = nullptr;
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -415,6 +418,79 @@ private:
         });
     }
 
+    // Idle-state random liveliness: random mild emotion or gentle in-place action.
+    void StartIdleAnimTimer() {
+        if (idle_anim_timer_ != nullptr) {
+            return;
+        }
+        esp_timer_create_args_t timer_args = {
+            .callback = &IdleTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "idle_anim",
+            .skip_unhandled_events = false,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &idle_anim_timer_));
+        esp_timer_start_once(idle_anim_timer_, 10 * 1000 * 1000);
+    }
+
+    static void IdleTimerCallback(void* arg) {
+        EspHi* self = static_cast<EspHi*>(arg);
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            esp_timer_start_once(self->idle_anim_timer_, 5 * 1000 * 1000);
+            return;
+        }
+        app.Schedule([self]() { self->IdleRandomTick(); });
+    }
+
+    void IdleRandomTick() {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+
+        if (esp_random() % 10 < 8) {
+            // Emotion: weighted buckets.
+            uint32_t er = esp_random() % 100;
+            const char* emotion = "happy";
+            if (er < 70) {
+                static const char* happy[] = {"happy", "laughing", "funny", "loving", "confident", "silly"};
+                emotion = happy[esp_random() % (sizeof(happy) / sizeof(happy[0]))];
+            } else if (er < 90) {
+                static const char* calm[] = {"relaxed", "thinking", "confused"};
+                emotion = calm[esp_random() % (sizeof(calm) / sizeof(calm[0]))];
+            } else if (er < 97) {
+                emotion = "winking";
+            } else {
+                emotion = "sleepy";
+            }
+            if (display_) {
+                display_->SetEmotion(emotion);
+            }
+        } else {
+            // Gentle in-place action: weighted buckets, then return to neutral.
+            uint32_t ar = esp_random() % 100;
+            if (ar < 30) {
+                dog_action_args_t args = {.repeat_count = 4};
+                servo_dog_ctrl_send(DOG_STATE_SWAY, &args);
+            } else if (ar < 60) {
+                servo_dog_ctrl_send(DOG_STATE_SWAY_BACK_FORTH, NULL);
+            } else if (ar < 80) {
+                servo_dog_ctrl_send(DOG_STATE_BOW, NULL);
+            } else if (ar < 90) {
+                servo_dog_ctrl_send(DOG_STATE_BOW_LEAN, NULL);
+            } else if (ar < 97) {
+                servo_dog_ctrl_send(DOG_STATE_SHAKE_BACK_LEGS, NULL);
+            } else {
+                servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
+            }
+            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+        }
+
+        uint64_t next_us = (8000 + esp_random() % 7000) * 1000;
+        esp_timer_start_once(idle_anim_timer_, next_us);
+    }
 public:
     EspHi() : boot_button_(BOOT_BUTTON_GPIO),
         audio_wake_button_(AUDIO_WAKE_BUTTON_GPIO),
@@ -425,6 +501,7 @@ public:
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeTools();
+        StartIdleAnimTimer();
     }
 
     virtual AudioCodec* GetAudioCodec() override
