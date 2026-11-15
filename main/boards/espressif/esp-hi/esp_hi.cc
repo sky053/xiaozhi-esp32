@@ -102,6 +102,7 @@ private:
     led_strip_handle_t led_strip_;
     bool led_on_ = false;
     esp_timer_handle_t idle_anim_timer_ = nullptr;
+    volatile bool idle_tick_busy_ = false;
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -418,7 +419,29 @@ private:
         });
     }
 
-    // Idle-state random liveliness: random mild emotion or gentle in-place action.
+    // ---- Idle-state random liveliness ------------------------------------
+    // A one-shot esp_timer wakes the main thread periodically. The timer is
+    // always re-armed inside the callback itself, so it can never stall even
+    // if the scheduled tick runs after the device has left the idle state.
+
+    static constexpr int64_t kFirstStartUs       = 12 * 1000 * 1000; // 12 s after boot
+    static constexpr int64_t kRecheckUs          = 5 * 1000 * 1000;  // re-check while non-idle
+    static constexpr int64_t kMinIdleDelayUs     = 8 * 1000 * 1000;
+    static constexpr uint32_t kIdleDelayJitterMs = 7000;
+
+    void ArmIdleTimer(int64_t delay_us) {
+        if (idle_anim_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(idle_anim_timer_);
+        esp_timer_start_once(idle_anim_timer_, delay_us);
+    }
+
+    int64_t NextIdleDelayUs() const {
+        uint32_t jitter_ms = esp_random() % kIdleDelayJitterMs;
+        return kMinIdleDelayUs + static_cast<int64_t>(jitter_ms) * 1000;
+    }
+
     void StartIdleAnimTimer() {
         if (idle_anim_timer_ != nullptr) {
             return;
@@ -430,66 +453,88 @@ private:
             .name = "idle_anim",
             .skip_unhandled_events = false,
         };
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &idle_anim_timer_));
-        esp_timer_start_once(idle_anim_timer_, 10 * 1000 * 1000);
+        esp_err_t err = esp_timer_create(&timer_args, &idle_anim_timer_);
+        if (err != ESP_OK || idle_anim_timer_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create idle anim timer: %d", err);
+            idle_anim_timer_ = nullptr;
+            return;
+        }
+        ArmIdleTimer(kFirstStartUs);
     }
 
     static void IdleTimerCallback(void* arg) {
         EspHi* self = static_cast<EspHi*>(arg);
-        auto& app = Application::GetInstance();
-        if (app.GetDeviceState() != kDeviceStateIdle) {
-            esp_timer_start_once(self->idle_anim_timer_, 5 * 1000 * 1000);
+        if (self == nullptr) {
             return;
         }
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            // Still connecting / busy: re-arm and check again later.
+            self->ArmIdleTimer(kRecheckUs);
+            return;
+        }
+        // Re-arm first so the timer cannot stall, then run the tick on the
+        // main thread where display/servo calls are safe.
+        self->ArmIdleTimer(self->NextIdleDelayUs());
         app.Schedule([self]() { self->IdleRandomTick(); });
     }
 
     void IdleRandomTick() {
+        if (idle_tick_busy_) {
+            return;
+        }
         auto& app = Application::GetInstance();
         if (app.GetDeviceState() != kDeviceStateIdle) {
             return;
         }
+        idle_tick_busy_ = true;
 
         if (esp_random() % 10 < 8) {
-            // Emotion: weighted buckets.
-            uint32_t er = esp_random() % 100;
-            const char* emotion = "happy";
-            if (er < 70) {
-                static const char* happy[] = {"happy", "laughing", "funny", "loving", "confident", "silly"};
-                emotion = happy[esp_random() % (sizeof(happy) / sizeof(happy[0]))];
-            } else if (er < 90) {
-                static const char* calm[] = {"relaxed", "thinking", "confused"};
-                emotion = calm[esp_random() % (sizeof(calm) / sizeof(calm[0]))];
-            } else if (er < 97) {
-                emotion = "winking";
-            } else {
-                emotion = "sleepy";
-            }
-            if (display_) {
-                display_->SetEmotion(emotion);
-            }
+            PlayRandomEmotion();
         } else {
-            // Gentle in-place action: weighted buckets, then return to neutral.
-            uint32_t ar = esp_random() % 100;
-            if (ar < 30) {
-                dog_action_args_t args = {.repeat_count = 4};
-                servo_dog_ctrl_send(DOG_STATE_SWAY, &args);
-            } else if (ar < 60) {
-                servo_dog_ctrl_send(DOG_STATE_SWAY_BACK_FORTH, NULL);
-            } else if (ar < 80) {
-                servo_dog_ctrl_send(DOG_STATE_BOW, NULL);
-            } else if (ar < 90) {
-                servo_dog_ctrl_send(DOG_STATE_BOW_LEAN, NULL);
-            } else if (ar < 97) {
-                servo_dog_ctrl_send(DOG_STATE_SHAKE_BACK_LEGS, NULL);
-            } else {
-                servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
-            }
-            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+            PlayRandomGentleAction();
         }
 
-        uint64_t next_us = (8000 + esp_random() % 7000) * 1000;
-        esp_timer_start_once(idle_anim_timer_, next_us);
+        idle_tick_busy_ = false;
+    }
+
+    void PlayRandomEmotion() {
+        uint32_t er = esp_random() % 100;
+        const char* emotion = "happy";
+        if (er < 70) {
+            static const char* happy[] = {"happy", "laughing", "funny", "loving", "confident", "silly"};
+            emotion = happy[esp_random() % (sizeof(happy) / sizeof(happy[0]))];
+        } else if (er < 90) {
+            static const char* calm[] = {"relaxed", "thinking", "confused"};
+            emotion = calm[esp_random() % (sizeof(calm) / sizeof(calm[0]))];
+        } else if (er < 97) {
+            emotion = "winking";
+        } else {
+            emotion = "sleepy";
+        }
+        if (display_ != nullptr) {
+            display_->SetEmotion(emotion);
+        }
+    }
+
+    void PlayRandomGentleAction() {
+        uint32_t ar = esp_random() % 100;
+        if (ar < 30) {
+            dog_action_args_t args = {.repeat_count = 4};
+            servo_dog_ctrl_send(DOG_STATE_SWAY, &args);
+        } else if (ar < 60) {
+            servo_dog_ctrl_send(DOG_STATE_SWAY_BACK_FORTH, NULL);
+        } else if (ar < 80) {
+            servo_dog_ctrl_send(DOG_STATE_BOW, NULL);
+        } else if (ar < 90) {
+            servo_dog_ctrl_send(DOG_STATE_BOW_LEAN, NULL);
+        } else if (ar < 97) {
+            servo_dog_ctrl_send(DOG_STATE_SHAKE_BACK_LEGS, NULL);
+        } else {
+            servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
+        }
+        // Return to a neutral standing pose after the motion finishes.
+        servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
     }
 public:
     EspHi() : boot_button_(BOOT_BUTTON_GPIO),
