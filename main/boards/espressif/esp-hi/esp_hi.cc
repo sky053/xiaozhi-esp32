@@ -103,6 +103,8 @@ private:
     bool led_on_ = false;
     esp_timer_handle_t idle_anim_timer_ = nullptr;
     volatile bool idle_tick_busy_ = false;
+    int8_t last_emotion_idx_ = -1;
+    int8_t last_action_idx_ = -1;
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -424,10 +426,10 @@ private:
     // always re-armed inside the callback itself, so it can never stall even
     // if the scheduled tick runs after the device has left the idle state.
 
-    static constexpr int64_t kFirstStartUs       = 12 * 1000 * 1000; // 12 s after boot
-    static constexpr int64_t kRecheckUs          = 5 * 1000 * 1000;  // re-check while non-idle
-    static constexpr int64_t kMinIdleDelayUs     = 8 * 1000 * 1000;
-    static constexpr uint32_t kIdleDelayJitterMs = 7000;
+    static constexpr int64_t kFirstStartUs       = 15 * 1000 * 1000; // 15 s after boot
+    static constexpr int64_t kRecheckUs           = 6 * 1000 * 1000;  // re-check while non-idle
+    static constexpr int64_t kMinIdleDelayUs     = 10 * 1000 * 1000;
+    static constexpr uint32_t kIdleDelayJitterMs = 8000;
 
     void ArmIdleTimer(int64_t delay_us) {
         if (idle_anim_timer_ == nullptr) {
@@ -489,7 +491,8 @@ private:
         }
         idle_tick_busy_ = true;
 
-        if (esp_random() % 10 < 8) {
+        // ~70% a light face, ~30% a gentle in-place action.
+        if (esp_random() % 10 < 7) {
             PlayRandomEmotion();
         } else {
             PlayRandomGentleAction();
@@ -499,42 +502,44 @@ private:
     }
 
     void PlayRandomEmotion() {
-        uint32_t er = esp_random() % 100;
-        const char* emotion = "happy";
-        if (er < 70) {
-            static const char* happy[] = {"happy", "laughing", "funny", "loving", "confident", "silly"};
-            emotion = happy[esp_random() % (sizeof(happy) / sizeof(happy[0]))];
-        } else if (er < 90) {
-            static const char* calm[] = {"relaxed", "thinking", "confused"};
-            emotion = calm[esp_random() % (sizeof(calm) / sizeof(calm[0]))];
-        } else if (er < 97) {
-            emotion = "winking";
-        } else {
-            emotion = "sleepy";
+        // Friendly and mild idle faces; a couple of thoughtful/slant-eye
+        // looks are kept for variety, like a real pet glancing around.
+        static const char* const emotions[] = {
+            "happy", "laughing", "funny", "loving", "confident", "silly",
+            "relaxed", "thinking", "confused", "winking", "sleepy",
+        };
+        const int count = sizeof(emotions) / sizeof(emotions[0]);
+        int idx = static_cast<int>(esp_random() % count);
+        if (count > 1 && idx == last_emotion_idx_) {
+            idx = (idx + 1) % count;
         }
+        last_emotion_idx_ = static_cast<int8_t>(idx);
         if (display_ != nullptr) {
-            display_->SetEmotion(emotion);
+            display_->SetEmotion(emotions[idx]);
         }
     }
 
     void PlayRandomGentleAction() {
-        uint32_t ar = esp_random() % 100;
-        if (ar < 30) {
-            dog_action_args_t args = {.repeat_count = 4};
-            servo_dog_ctrl_send(DOG_STATE_SWAY, &args);
-        } else if (ar < 60) {
-            servo_dog_ctrl_send(DOG_STATE_SWAY_BACK_FORTH, NULL);
-        } else if (ar < 80) {
-            servo_dog_ctrl_send(DOG_STATE_BOW, NULL);
-        } else if (ar < 90) {
-            servo_dog_ctrl_send(DOG_STATE_BOW_LEAN, NULL);
-        } else if (ar < 97) {
-            servo_dog_ctrl_send(DOG_STATE_SHAKE_BACK_LEGS, NULL);
-        } else {
-            servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
+        // Gentle, in-place actions that return to a neutral pose on their own.
+        static const servo_dog_state_t actions[] = {
+            DOG_STATE_BOW,
+            DOG_STATE_BOW_LEAN,
+            DOG_STATE_SWAY_BACK_FORTH,
+            DOG_STATE_SWAY,
+            DOG_STATE_LEAN_BACK,
+        };
+        const int count = sizeof(actions) / sizeof(actions[0]);
+        int idx = static_cast<int>(esp_random() % count);
+        if (count > 1 && idx == last_action_idx_) {
+            idx = (idx + 1) % count;
         }
-        // Return to a neutral standing pose after the motion finishes.
-        servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+        last_action_idx_ = static_cast<int8_t>(idx);
+        // Pass args=NULL so the component's built-in defaults (speed, repeat,
+        // hold) are used: a hand-built args struct would leave speed zero and
+        // skip the action body. The action runs to completion on the servo
+        // task and returns to neutral on its own; do not queue an extra IDLE
+        // reset right after it.
+        servo_dog_ctrl_send(actions[idx], NULL);
     }
 public:
     EspHi() : boot_button_(BOOT_BUTTON_GPIO),
