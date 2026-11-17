@@ -95,6 +95,9 @@ jobs:
           if [[ "$BUILD_OPTIONS_JSON" != "null" && -n "$BUILD_OPTIONS_JSON" ]]; then
             OPTIONS+=(--build-options-json "$BUILD_OPTIONS_JSON")
           fi
+          if [[ "$BOARD" == "espressif/esp-hi" ]]; then
+            OPTIONS+=(--wake-word nihaoxiaozhi)
+          fi
           python scripts/build.py "$BOARD" --name "$VARIANT" "${OPTIONS[@]}"
 
       - name: Upload artifacts
