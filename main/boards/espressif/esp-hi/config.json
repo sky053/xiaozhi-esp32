@@ -28,7 +28,9 @@
                 "CONFIG_NEWLIB_NANO_FORMAT=y",
                 "CONFIG_ESP_CONSOLE_NONE=y",
                 "CONFIG_COMPILER_OPTIMIZATION_SIZE=y",
-                "CONFIG_CODEC_DATA_ADC_SUPPORT=y"
+                "CONFIG_CODEC_DATA_ADC_SUPPORT=y",
+                "CONFIG_SR_WN_WN9S_HIESP=n",
+                "CONFIG_SR_WN_WN9S_NIHAOXIAOZHI=y"
             ]
         }
     ]

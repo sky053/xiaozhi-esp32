@@ -106,6 +106,16 @@ private:
     int8_t last_emotion_idx_ = -1;
     int8_t last_action_idx_ = -1;
 
+    // ---- Pose state machine ---------------------------------------------
+    // The servo component has three postures that do NOT return to neutral
+    // on their own: LAY_DOWN (resting) and RETRACT_LEGS (curled up asleep).
+    // Everything else ends standing. We track which one we are in so a random
+    // action is never played while the dog is lying or curled up.
+    enum class DogPose { kStanding, kResting, kSleeping };
+    DogPose pose_ = DogPose::kStanding;
+    int64_t idle_entered_us_ = 0;   // when the device last settled into idle
+    int64_t rest_until_us_ = 0;     // how long to stay lying down before standing
+
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                  int32_t event_id, void* event_data)
@@ -421,15 +431,26 @@ private:
         });
     }
 
-    // ---- Idle-state random liveliness ------------------------------------
+    // ---- Idle-state liveliness + pose state machine -----------------------
     // A one-shot esp_timer wakes the main thread periodically. The timer is
     // always re-armed inside the callback itself, so it can never stall even
     // if the scheduled tick runs after the device has left the idle state.
+    //
+    // While idle the dog behaves like a pet:
+    //   * every ~12-18 s it either changes its face or performs ONE complete
+    //     in-place action;
+    //   * occasionally it lies down (LAY_DOWN) and actually stays resting;
+    //   * after a long stretch alone it curls up (RETRACT_LEGS) and sleeps,
+    //     while the local wake-word engine keeps listening the whole time;
+    //   * any real interaction stands it back up before anything else.
 
-    static constexpr int64_t kFirstStartUs       = 15 * 1000 * 1000; // 15 s after boot
-    static constexpr int64_t kRecheckUs           = 6 * 1000 * 1000;  // re-check while non-idle
-    static constexpr int64_t kMinIdleDelayUs     = 10 * 1000 * 1000;
-    static constexpr uint32_t kIdleDelayJitterMs = 8000;
+    static constexpr int64_t kFirstStartUs        = 15 * 1000 * 1000;   // 15 s after boot
+    static constexpr int64_t kNonIdleRecheckUs    = 1 * 1000 * 1000;    // quick check while not standing
+    static constexpr int64_t kRecheckUs           = 6 * 1000 * 1000;    // slow check while standing
+    static constexpr int64_t kMinIdleDelayUs      = 12 * 1000 * 1000;
+    static constexpr uint32_t kIdleDelayJitterMs  = 6000;
+    static constexpr int64_t kRestHoldUs          = 30 * 1000 * 1000;   // stay lying ~30 s
+    static constexpr int64_t kSleepAfterIdleUs    = 120 * 1000 * 1000;  // alone 2 min -> curl up
 
     void ArmIdleTimer(int64_t delay_us) {
         if (idle_anim_timer_ == nullptr) {
@@ -471,14 +492,31 @@ private:
         }
         auto& app = Application::GetInstance();
         if (app.GetDeviceState() != kDeviceStateIdle) {
-            // Still connecting / busy: re-arm and check again later.
-            self->ArmIdleTimer(kRecheckUs);
+            // The dog was woken up (button, shake gesture or wake word) or is
+            // connecting. Make sure it stands back up, on the main thread where
+            // servo calls are safe.
+            self->ArmIdleTimer(self->pose_ == DogPose::kStanding ? kRecheckUs : kNonIdleRecheckUs);
+            app.Schedule([self]() { self->StandUpIfNeeded(); });
             return;
         }
         // Re-arm first so the timer cannot stall, then run the tick on the
         // main thread where display/servo calls are safe.
         self->ArmIdleTimer(self->NextIdleDelayUs());
         app.Schedule([self]() { self->IdleRandomTick(); });
+    }
+
+    // Leaves any non-standing posture and returns to neutral. Safe to call
+    // repeatedly; it is a no-op when already standing.
+    void StandUpIfNeeded() {
+        idle_entered_us_ = 0;
+        if (pose_ == DogPose::kStanding) {
+            return;
+        }
+        const char* was = (pose_ == DogPose::kSleeping) ? "sleeping" : "resting";
+        servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+        pose_ = DogPose::kStanding;
+        rest_until_us_ = 0;
+        ESP_LOGI(TAG, "Stand up: leaving %s posture", was);
     }
 
     void IdleRandomTick() {
@@ -491,7 +529,40 @@ private:
         }
         idle_tick_busy_ = true;
 
-        // ~70% a light face, ~30% a gentle in-place action.
+        const int64_t now = esp_timer_get_time();
+        if (idle_entered_us_ == 0) {
+            idle_entered_us_ = now;
+        }
+
+        // Already curled up asleep: stay quiet and keep listening for the wake
+        // word instead of cycling faces.
+        if (pose_ == DogPose::kSleeping) {
+            idle_tick_busy_ = false;
+            return;
+        }
+
+        // Alone for a long time -> curl the legs up and go to sleep.
+        if (now - idle_entered_us_ >= kSleepAfterIdleUs) {
+            EnterSleep();
+            idle_tick_busy_ = false;
+            return;
+        }
+
+        // Lying down: hold the pose until the rest timer expires, then stand up
+        // on a later tick so the pause really reads as rest.
+        if (pose_ == DogPose::kResting) {
+            if (now < rest_until_us_) {
+                idle_tick_busy_ = false;
+                return;
+            }
+            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+            pose_ = DogPose::kStanding;
+            ESP_LOGI(TAG, "Rest finished, stand up");
+            idle_tick_busy_ = false;
+            return;
+        }
+
+        // ~70% a light face, ~30% one complete in-place action.
         if (esp_random() % 10 < 7) {
             PlayRandomEmotion();
         } else {
@@ -499,6 +570,25 @@ private:
         }
 
         idle_tick_busy_ = false;
+    }
+
+    void EnterSleep() {
+        // Stand up first so RETRACT_LEGS always starts from the neutral pose,
+        // then curl up. Both commands run back-to-back on the servo queue.
+        if (pose_ != DogPose::kStanding) {
+            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+        }
+        servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
+        pose_ = DogPose::kSleeping;
+        rest_until_us_ = 0;
+        // The asset set has no dedicated "sleeping" face; sad_loop is the
+        // closest low-lidded look, and the face must stop cycling through
+        // smiles while the dog is asleep.
+        if (display_ != nullptr) {
+            display_->SetEmotion("sleepy");
+        }
+        ESP_LOGI(TAG, "Idle for %llds, retract legs and sleep",
+                 static_cast<long long>(kSleepAfterIdleUs / 1000000));
     }
 
     void PlayRandomEmotion() {
@@ -520,13 +610,23 @@ private:
     }
 
     void PlayRandomGentleAction() {
-        // Gentle, in-place actions that return to a neutral pose on their own.
-        static const servo_dog_state_t actions[] = {
-            DOG_STATE_BOW,
-            DOG_STATE_BOW_LEAN,
-            DOG_STATE_SWAY_BACK_FORTH,
-            DOG_STATE_SWAY,
-            DOG_STATE_LEAN_BACK,
+        // Everything here is in place. All but LAY_DOWN end standing on their
+        // own, so no extra IDLE reset is queued after them: that trailing
+        // reset was what made the dog look like it twitched instead of
+        // performing a whole movement.
+        struct ActionSpec {
+            servo_dog_state_t state;
+            bool lies_down;
+        };
+        static const ActionSpec actions[] = {
+            { DOG_STATE_BOW,             false },  // front-half stretch
+            { DOG_STATE_SHAKE_BACK_LEGS, false },  // hind-leg stretch
+            { DOG_STATE_SHAKE_HAND,      false },  // raise a paw to say hello
+            { DOG_STATE_BOW_LEAN,        false },  // bow + lean-back combo
+            { DOG_STATE_SWAY_BACK_FORTH, false },  // sway back and forth
+            { DOG_STATE_SWAY,            false },  // sway left and right
+            { DOG_STATE_LEAN_BACK,       false },  // lean-back stretch
+            { DOG_STATE_LAY_DOWN,        true  },  // lie down and rest
         };
         const int count = sizeof(actions) / sizeof(actions[0]);
         int idx = static_cast<int>(esp_random() % count);
@@ -534,12 +634,16 @@ private:
             idx = (idx + 1) % count;
         }
         last_action_idx_ = static_cast<int8_t>(idx);
+
         // Pass args=NULL so the component's built-in defaults (speed, repeat,
         // hold) are used: a hand-built args struct would leave speed zero and
-        // skip the action body. The action runs to completion on the servo
-        // task and returns to neutral on its own; do not queue an extra IDLE
-        // reset right after it.
-        servo_dog_ctrl_send(actions[idx], NULL);
+        // skip the action body entirely.
+        servo_dog_ctrl_send(actions[idx].state, NULL);
+
+        if (actions[idx].lies_down) {
+            pose_ = DogPose::kResting;
+            rest_until_us_ = esp_timer_get_time() + kRestHoldUs;
+        }
     }
 public:
     EspHi() : boot_button_(BOOT_BUTTON_GPIO),
