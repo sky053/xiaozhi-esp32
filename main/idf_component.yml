@@ -127,8 +127,11 @@ dependencies:
     version: ^1.6.4
     rules:
     - if: target in [esp32p4]
-  espfriends/servo_dog_ctrl:
-    version: ^0.2.0
+  # The servo dog driver now lives in boards/espressif/esp-hi and is compiled
+  # into main for that board only, so the managed component is not pulled in
+  # any more. Its servo backend is still needed for iot_servo.h.
+  espressif/servo:
+    version: ^1.0.0
     rules:
     - if: target in [esp32c3]
 

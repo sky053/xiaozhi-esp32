@@ -342,6 +342,11 @@ elseif(CONFIG_BOARD_TYPE_ESP_HI)
     set(BOARD_DIR "espressif/esp-hi")
     # Set ESP_HI emoji directory for DEFAULT_ASSETS_EXTRA_FILES
     set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_BINARY_DIR}/emoji")
+    # The servo dog driver used to come from the esfriends/servo_dog_ctrl
+    # managed component, which cut the servo power 50 ms after every action.
+    # It now lives next to this board and is picked up by the BOARD_SOURCES
+    # glob; only the board header needs an explicit include path.
+    list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/espressif/esp-hi)
 elseif(CONFIG_BOARD_TYPE_ESP_VOCAT)
     set(BOARD_DIR "espressif/esp-vocat")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -1197,6 +1202,12 @@ endif()
 # on that target and keep other target builds unchanged.
 if(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_driver_usb_serial_jtag)
+endif()
+# iot_servo.h comes from the espressif/servo managed component, which is only
+# declared for esp32c3 in idf_component.yml (that is where the esp-hi board
+# compiles its own board-local servo_dog_ctrl.c).
+if(IDF_TARGET STREQUAL "esp32c3")
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__servo)
 endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
