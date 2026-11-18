@@ -102,7 +102,15 @@ private:
     led_strip_handle_t led_strip_;
     bool led_on_ = false;
     esp_timer_handle_t idle_anim_timer_ = nullptr;
+    // Separate one-shot timer: after being woken from sleep the dog answers
+    // first and only gets up a few seconds later, so it never jumps the instant
+    // it hears its name.
+    esp_timer_handle_t wake_stand_timer_ = nullptr;
     volatile bool idle_tick_busy_ = false;
+    volatile bool dog_action_busy_ = false;
+    bool mood_led_enabled_ = true;      // follow the user's light on/off intent
+    int64_t last_wake_us_ = 0;          // last time it reacted to being woken
+    uint8_t wake_burst_ = 0;            // repeated wake-ups in a short window
     int8_t last_emotion_idx_ = -1;
     int8_t last_action_idx_ = -1;
 
@@ -370,8 +378,9 @@ private:
         
         // 扩展动作控制
         mcp_server.AddTool("self.dog.advanced_control", "机器人的扩展动作。机器人可以做以下扩展动作：\n"
-            "sway_back_forth: 前后摇摆\nlay_down: 趴下\nsway: 左右摇摆\nretract_legs: 收回腿部\n"
-            "shake_hand: 握手\nshake_back_legs: 伸懒腰\njump_forward: 向前跳跃", 
+            "sway_back_forth: 前后摇摆\nlay_down: 趴下\nsway: 左右摇摆\nretract_legs: 收回腿部（睡觉）\n"
+            "shake_hand: 握手/打招呼\nshake_back_legs: 伸懒腰\njump_forward: 向前跳跃\n"
+            "turn_around: 原地转一整圈\nstand: 从趴下或收腿姿态慢慢站起来", 
             PropertyList({
                 Property("action", kPropertyTypeString),
             }), [this](const PropertyList& properties) -> ReturnValue {
@@ -380,22 +389,51 @@ private:
                     servo_dog_ctrl_send(DOG_STATE_SWAY_BACK_FORTH, NULL);
                 } else if (action == "lay_down") {
                     servo_dog_ctrl_send(DOG_STATE_LAY_DOWN, NULL);
+                    pose_ = DogPose::kResting;
+                    rest_until_us_ = esp_timer_get_time() + kRestHoldUs;
                 } else if (action == "sway") {
                     dog_action_args_t args = {
                         .repeat_count = 4,
                     };
                     servo_dog_ctrl_send(DOG_STATE_SWAY, &args);
                 } else if (action == "retract_legs") {
-                    servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
+                    EnterSleep();
                 } else if (action == "shake_hand") {
                     servo_dog_ctrl_send(DOG_STATE_SHAKE_HAND, NULL);
                 } else if (action == "shake_back_legs") {
                     servo_dog_ctrl_send(DOG_STATE_SHAKE_BACK_LEGS, NULL);
                 } else if (action == "jump_forward") {
                     servo_dog_ctrl_send(DOG_STATE_JUMP_FORWARD, NULL);
+                } else if (action == "turn_around") {
+                    /* Repeat twice the default so a single call really turns a
+                     * full circle instead of shuffling three steps. */
+                    dog_action_args_t args = {0};
+                    args.repeat_count = 4;
+                    args.speed = 80;
+                    args.hold_time_ms = NOT_USE;
+                    args.angle_offset = NOT_USE;
+                    servo_dog_ctrl_send(DOG_STATE_TURN_RIGHT, &args);
+                } else if (action == "stand") {
+                    StandUpIfNeeded();
                 } else {
                     return false;
                 }
+                return true;
+            });
+
+        // 睡眠 / 唤醒：只有用户明确要求时才收腿，其余时间一律保持站立
+        mcp_server.AddTool("self.dog.sleep",
+            "让机器狗收腿睡觉。只有当用户明确说“去睡觉”“睡觉吧”“歇着吧”时才调用；"
+            "调用后它会收起四条腿、切到睡觉表情，直到听到唤醒词或按键才起身。", 
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                EnterSleep();
+                return true;
+            });
+
+        mcp_server.AddTool("self.dog.wake",
+            "让机器狗站起来。用户说“站起来”“起来吧”“别睡了”时调用。", 
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                StandUpIfNeeded();
                 return true;
             });
 
@@ -405,12 +443,16 @@ private:
         });
 
         mcp_server.AddTool("self.light.turn_on", "打开灯", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            mood_led_enabled_ = true;
             SetLedColor(0xFF, 0xFF, 0xFF);
             led_on_ = true;
             return true;
         });
 
         mcp_server.AddTool("self.light.turn_off", "关闭灯", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            // Switching the light off also parks the automatic mood colours, so
+            // the dog does not light itself up again two seconds later.
+            mood_led_enabled_ = false;
             SetLedColor(0x00, 0x00, 0x00);
             led_on_ = false;
             return true;
@@ -425,6 +467,7 @@ private:
             int g = properties["g"].value<int>();
             int b = properties["b"].value<int>();
 
+            mood_led_enabled_ = true;
             led_on_ = true;
             SetLedColor(r, g, b);
             return true;
@@ -445,12 +488,23 @@ private:
     //   * any real interaction stands it back up before anything else.
 
     static constexpr int64_t kFirstStartUs        = 15 * 1000 * 1000;   // 15 s after boot
-    static constexpr int64_t kNonIdleRecheckUs    = 1 * 1000 * 1000;    // quick check while not standing
     static constexpr int64_t kRecheckUs           = 6 * 1000 * 1000;    // slow check while standing
+    static constexpr int64_t kSleepPollUs         = 1 * 1000 * 1000;    // poll fast while asleep/resting
     static constexpr int64_t kMinIdleDelayUs      = 12 * 1000 * 1000;
     static constexpr uint32_t kIdleDelayJitterMs  = 6000;
     static constexpr int64_t kRestHoldUs          = 30 * 1000 * 1000;   // stay lying ~30 s
-    static constexpr int64_t kSleepAfterIdleUs    = 120 * 1000 * 1000;  // alone 2 min -> curl up
+    static constexpr int64_t kWakeStandDelayUs    = 3 * 1000 * 1000;    // answer first, stand 3 s later
+    static constexpr int64_t kMoodBurstWindowUs   = 60 * 1000 * 1000;   // repeated wake-ups inside 1 min
+
+    // Small mood palette for the four WS2812 pixels. The dog carries its state
+    // in the light as well as on the screen, the way a pet shows how it feels.
+    struct MoodColor { uint8_t r; uint8_t g; uint8_t b; };
+    static constexpr MoodColor kMoodHappy {  20, 140,  40 };  // warm green
+    static constexpr MoodColor kMoodWake  {  90,  90,  90 };  // bright grey flash
+    static constexpr MoodColor kMoodSleep {   0,  12,  60 };  // dim blue
+    static constexpr MoodColor kMoodCalm  {  25,  40,  20 };  // low moss
+    static constexpr MoodColor kMoodSad   {   0,  16,  70 };  // cold blue
+    static constexpr MoodColor kMoodAngry { 100,   0,   0 };  // red
 
     void ArmIdleTimer(int64_t delay_us) {
         if (idle_anim_timer_ == nullptr) {
@@ -485,38 +539,143 @@ private:
         ArmIdleTimer(kFirstStartUs);
     }
 
+    // Sets the face and, unless the user switched the light off, the mood colour.
+    void SetMood(const char* emotion, MoodColor color) {
+        if (display_ != nullptr && emotion != nullptr) {
+            display_->SetEmotion(emotion);
+        }
+        if (mood_led_enabled_) {
+            SetLedColor(color.r, color.g, color.b);
+            led_on_ = true;
+        }
+    }
+
+    void StartWakeStandTimer() {
+        if (wake_stand_timer_ != nullptr) {
+            return;
+        }
+        esp_timer_create_args_t timer_args = {
+            .callback = &WakeStandCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wake_stand",
+            .skip_unhandled_events = false,
+        };
+        if (esp_timer_create(&timer_args, &wake_stand_timer_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create wake stand timer");
+            wake_stand_timer_ = nullptr;
+        }
+    }
+
+    static void WakeStandCallback(void* arg) {
+        EspHi* self = static_cast<EspHi*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        // Stand on the main thread, where display and servo calls are safe.
+        Application::GetInstance().Schedule([self]() { self->StandUpIfNeeded(); });
+    }
+
+    void ArmWakeStandTimer(int64_t delay_us) {
+        if (wake_stand_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(wake_stand_timer_);
+        esp_timer_start_once(wake_stand_timer_, delay_us);
+    }
+
     static void IdleTimerCallback(void* arg) {
         EspHi* self = static_cast<EspHi*>(arg);
         if (self == nullptr) {
             return;
         }
         auto& app = Application::GetInstance();
+
         if (app.GetDeviceState() != kDeviceStateIdle) {
-            // The dog was woken up (button, shake gesture or wake word) or is
-            // connecting. Make sure it stands back up, on the main thread where
-            // servo calls are safe.
-            self->ArmIdleTimer(self->pose_ == DogPose::kStanding ? kRecheckUs : kNonIdleRecheckUs);
-            app.Schedule([self]() { self->StandUpIfNeeded(); });
+            // Something woke the dog up: button, gesture, wake word, cloud.
+            if (self->pose_ != DogPose::kStanding) {
+                // Answer first, get up a few seconds later (scheduled inside).
+                app.Schedule([self]() { self->WakeUpResponse(); });
+            } else if (self->dog_action_busy_) {
+                // It listens to its owner: a random action is cut short the
+                // moment somebody talks to it.
+                servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+                self->dog_action_busy_ = false;
+            }
+            // Poll quickly so a sleeping dog reacts to the wake word within a
+            // second instead of waiting for the next random slot.
+            self->ArmIdleTimer(self->pose_ == DogPose::kStanding ? kRecheckUs : kSleepPollUs);
             return;
         }
+
+        if (self->pose_ == DogPose::kSleeping) {
+            // Asleep on request: no random actions, just keep polling so the
+            // wake word can bring it back up.
+            self->ArmIdleTimer(kSleepPollUs);
+            return;
+        }
+        if (self->pose_ == DogPose::kResting) {
+            // Lying down: poll faster so it stands up promptly when disturbed.
+            self->ArmIdleTimer(kSleepPollUs);
+            app.Schedule([self]() { self->IdleRandomTick(); });
+            return;
+        }
+
         // Re-arm first so the timer cannot stall, then run the tick on the
         // main thread where display/servo calls are safe.
         self->ArmIdleTimer(self->NextIdleDelayUs());
         app.Schedule([self]() { self->IdleRandomTick(); });
     }
 
-    // Leaves any non-standing posture and returns to neutral. Safe to call
-    // repeatedly; it is a no-op when already standing.
+    // Slowly unfolds from the curled-up pose. Safe to call repeatedly; it is a
+    // no-op when already standing on all four legs.
     void StandUpIfNeeded() {
         idle_entered_us_ = 0;
         if (pose_ == DogPose::kStanding) {
             return;
         }
         const char* was = (pose_ == DogPose::kSleeping) ? "sleeping" : "resting";
-        servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
         pose_ = DogPose::kStanding;
         rest_until_us_ = 0;
-        ESP_LOGI(TAG, "Stand up: leaving %s posture", was);
+        // DOG_STATE_STAND walks every leg back frame by frame (~3.8 s). Using
+        // DOG_STATE_IDLE here is what snapped the legs straight and then cut
+        // the torque, so the dog never got back on its feet.
+        servo_dog_ctrl_send(DOG_STATE_STAND, NULL);
+        SetMood("happy", kMoodHappy);
+        ESP_LOGI(TAG, "Stand up slowly: leaving %s posture", was);
+    }
+
+    // Reacts the moment it is woken up: a face and a short cue first, the actual
+    // unfold is armed for a few seconds later so it does not snap upright.
+    void WakeUpResponse() {
+        const int64_t now = esp_timer_get_time();
+        if (last_wake_us_ != 0 && now - last_wake_us_ < kMoodBurstWindowUs) {
+            if (wake_burst_ < 255) {
+                wake_burst_++;
+            }
+        } else {
+            wake_burst_ = 1;
+        }
+        last_wake_us_ = now;
+        const bool annoyed = wake_burst_ >= 3;
+
+        if (pose_ == DogPose::kSleeping) {
+            SetMood(annoyed ? "sad" : "happy", annoyed ? kMoodSad : kMoodWake);
+            // A built-in cue instead of talking: the board cannot speak on its
+            // own, but it can answer with a short sound.
+            Application::GetInstance().PlaySound(annoyed
+                ? Lang::Sounds::OGG_EXCLAMATION : Lang::Sounds::OGG_POPUP);
+            ArmWakeStandTimer(kWakeStandDelayUs);
+            ESP_LOGI(TAG, "Woken while asleep (burst %u): answer now, stand in %llds",
+                     static_cast<unsigned>(wake_burst_),
+                     static_cast<long long>(kWakeStandDelayUs / 1000000));
+        } else if (pose_ == DogPose::kResting) {
+            pose_ = DogPose::kStanding;
+            rest_until_us_ = 0;
+            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+            SetMood(annoyed ? "sad" : "happy", annoyed ? kMoodSad : kMoodHappy);
+            ESP_LOGI(TAG, "Woken while resting, back on its feet");
+        }
     }
 
     void IdleRandomTick() {
@@ -534,36 +693,29 @@ private:
             idle_entered_us_ = now;
         }
 
-        // Already curled up asleep: stay quiet and keep listening for the wake
-        // word instead of cycling faces.
+        // Asleep on request: stay quiet and keep listening for the wake word.
         if (pose_ == DogPose::kSleeping) {
             idle_tick_busy_ = false;
             return;
         }
 
-        // Alone for a long time -> curl the legs up and go to sleep.
-        if (now - idle_entered_us_ >= kSleepAfterIdleUs) {
-            EnterSleep();
-            idle_tick_busy_ = false;
-            return;
-        }
-
-        // Lying down: hold the pose until the rest timer expires, then stand up
-        // on a later tick so the pause really reads as rest.
+        // Lying down: hold the pose until the rest timer expires, then get up
+        // properly so the next random action starts from all four legs.
         if (pose_ == DogPose::kResting) {
             if (now < rest_until_us_) {
                 idle_tick_busy_ = false;
                 return;
             }
-            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
             pose_ = DogPose::kStanding;
+            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
+            SetMood("happy", kMoodHappy);
             ESP_LOGI(TAG, "Rest finished, stand up");
             idle_tick_busy_ = false;
             return;
         }
 
-        // ~70% a light face, ~30% one complete in-place action.
-        if (esp_random() % 10 < 7) {
+        // ~60% a light face, ~40% one complete action carrying its own mood.
+        if (esp_random() % 10 < 6) {
             PlayRandomEmotion();
         } else {
             PlayRandomGentleAction();
@@ -572,61 +724,69 @@ private:
         idle_tick_busy_ = false;
     }
 
+    // Only ever reached on an explicit "go to sleep" request.
     void EnterSleep() {
-        // Stand up first so RETRACT_LEGS always starts from the neutral pose,
-        // then curl up. Both commands run back-to-back on the servo queue.
-        if (pose_ != DogPose::kStanding) {
-            servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
-        }
+        // Back to neutral first so RETRACT_LEGS always starts from the same
+        // pose, then curl the legs up and settle into the sleeping mood.
+        servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
         servo_dog_ctrl_send(DOG_STATE_RETRACT_LEGS, NULL);
         pose_ = DogPose::kSleeping;
         rest_until_us_ = 0;
-        // The asset set has no dedicated "sleeping" face; sad_loop is the
-        // closest low-lidded look, and the face must stop cycling through
-        // smiles while the dog is asleep.
-        if (display_ != nullptr) {
-            display_->SetEmotion("sleepy");
-        }
-        ESP_LOGI(TAG, "Idle for %llds, retract legs and sleep",
-                 static_cast<long long>(kSleepAfterIdleUs / 1000000));
+        dog_action_busy_ = false;
+        idle_entered_us_ = 0;
+        SetMood("sleepy", kMoodSleep);
+        ESP_LOGI(TAG, "Sleep on request: legs retracted, still listening for the wake word");
     }
 
     void PlayRandomEmotion() {
-        // Friendly and mild idle faces; a couple of thoughtful/slant-eye
-        // looks are kept for variety, like a real pet glancing around.
-        static const char* const emotions[] = {
-            "happy", "laughing", "funny", "loving", "confident", "silly",
-            "relaxed", "thinking", "confused", "winking", "sleepy",
+        // Friendly, mild idle faces; the thoughtful/slant-eye looks stay in the
+        // pool on purpose, they make it read as a real pet glancing around.
+        struct FaceSpec {
+            const char* emotion;
+            MoodColor color;
         };
-        const int count = sizeof(emotions) / sizeof(emotions[0]);
+        static const FaceSpec faces[] = {
+            { "happy",     kMoodHappy },
+            { "laughing",  kMoodHappy },
+            { "funny",     kMoodHappy },
+            { "loving",    kMoodHappy },
+            { "confident", kMoodHappy },
+            { "silly",     kMoodHappy },
+            { "winking",   kMoodHappy },
+            { "relaxed",   kMoodCalm  },
+            { "thinking",  kMoodCalm  },
+            { "confused",  kMoodCalm  },
+            { "sleepy",    kMoodSleep },
+        };
+        const int count = sizeof(faces) / sizeof(faces[0]);
         int idx = static_cast<int>(esp_random() % count);
         if (count > 1 && idx == last_emotion_idx_) {
             idx = (idx + 1) % count;
         }
         last_emotion_idx_ = static_cast<int8_t>(idx);
-        if (display_ != nullptr) {
-            display_->SetEmotion(emotions[idx]);
-        }
+        SetMood(faces[idx].emotion, faces[idx].color);
     }
 
     void PlayRandomGentleAction() {
-        // Everything here is in place. All but LAY_DOWN end standing on their
-        // own, so no extra IDLE reset is queued after them: that trailing
-        // reset was what made the dog look like it twitched instead of
-        // performing a whole movement.
+        // Every entry is one complete in-place movement and carries the mood it
+        // belongs to, so body, face and light always tell the same story: a
+        // stretch looks sleepy, a wave looks happy.
         struct ActionSpec {
             servo_dog_state_t state;
+            int16_t repeat_count;   // >0: override, 0: use the table default
+            const char* emotion;
+            MoodColor color;
             bool lies_down;
         };
         static const ActionSpec actions[] = {
-            { DOG_STATE_BOW,             false },  // front-half stretch
-            { DOG_STATE_SHAKE_BACK_LEGS, false },  // hind-leg stretch
-            { DOG_STATE_SHAKE_HAND,      false },  // raise a paw to say hello
-            { DOG_STATE_BOW_LEAN,        false },  // bow + lean-back combo
-            { DOG_STATE_SWAY_BACK_FORTH, false },  // sway back and forth
-            { DOG_STATE_SWAY,            false },  // sway left and right
-            { DOG_STATE_LEAN_BACK,       false },  // lean-back stretch
-            { DOG_STATE_LAY_DOWN,        true  },  // lie down and rest
+            { DOG_STATE_BOW,             0, "sleepy",    kMoodSleep, false },  // front-leg stretch
+            { DOG_STATE_SHAKE_BACK_LEGS, 0, "sleepy",    kMoodSleep, false },  // hind-leg stretch
+            { DOG_STATE_SHAKE_HAND,      0, "happy",     kMoodHappy, false },  // wave hello
+            { DOG_STATE_SWAY_BACK_FORTH, 0, "laughing",  kMoodHappy, false },  // rock back and forth
+            { DOG_STATE_SWAY,            0, "silly",     kMoodHappy, false },  // sway side to side
+            { DOG_STATE_TURN_RIGHT,      4, "confident", kMoodHappy, false },  // turn in place
+            { DOG_STATE_BOW_LEAN,        0, "funny",     kMoodHappy, false },  // bow + lean combo
+            { DOG_STATE_LAY_DOWN,        0, "relaxed",   kMoodCalm,  true  },  // lie down and rest
         };
         const int count = sizeof(actions) / sizeof(actions[0]);
         int idx = static_cast<int>(esp_random() % count);
@@ -634,15 +794,29 @@ private:
             idx = (idx + 1) % count;
         }
         last_action_idx_ = static_cast<int8_t>(idx);
+        const ActionSpec& spec = actions[idx];
 
-        // Pass args=NULL so the component's built-in defaults (speed, repeat,
-        // hold) are used: a hand-built args struct would leave speed zero and
-        // skip the action body entirely.
-        servo_dog_ctrl_send(actions[idx].state, NULL);
+        SetMood(spec.emotion, spec.color);
 
-        if (actions[idx].lies_down) {
+        if (spec.repeat_count > 0) {
+            dog_action_args_t args = {0};
+            args.repeat_count = spec.repeat_count;
+            args.speed = 80;
+            args.hold_time_ms = NOT_USE;
+            args.angle_offset = NOT_USE;
+            servo_dog_ctrl_send(spec.state, &args);
+        } else {
+            // Pass NULL so the table's built-in defaults (speed, repeat, hold)
+            // are used: a hand-built args struct would zero out speed and the
+            // action body would be skipped entirely.
+            servo_dog_ctrl_send(spec.state, NULL);
+        }
+
+        if (spec.lies_down) {
             pose_ = DogPose::kResting;
             rest_until_us_ = esp_timer_get_time() + kRestHoldUs;
+        } else {
+            dog_action_busy_ = true;
         }
     }
 public:
@@ -656,6 +830,7 @@ public:
         InitializeLcdDisplay();
         InitializeTools();
         StartIdleAnimTimer();
+        StartWakeStandTimer();
     }
 
     virtual AudioCodec* GetAudioCodec() override
