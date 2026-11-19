@@ -650,17 +650,42 @@ static void servo_dog_stand(dog_action_args_t args)
         frame_ticks = 1;
     }
 
-    for (int i = 102; i >= 0; i--) {
+    /* Stage 1 - the hind legs leave the interference zone first.
+     * In the curled pose the hind feet sit below/inside the front feet, so the
+     * front legs physically cannot swing back while the hind ones are still
+     * tucked in. Only the first ~31 % of the hind travel is covered here, which
+     * is mostly a sideways slide: it clears the way without lifting the rear of
+     * the body much, so the centre of gravity does not run forward yet. */
+    const int hind_total  = 102;
+    const int front_total = 109;
+    const int hind_exit   = 32;
+    for (int i = hind_total; i >= hind_total - hind_exit; i--) {
         servo_set_angle(SERVO_BL, bl_angle_neutral - i);
         servo_set_angle(SERVO_BR, br_angle_neutral + i);
         SERVOR_DOG_ACTION_DELAY(frame_ticks);
     }
-    for (int i = 109; i >= 0; i--) {
-        servo_set_angle(SERVO_FL, fl_angle_neutral + i);
-        servo_set_angle(SERVO_FR, fr_angle_neutral - i);
-        SERVOR_DOG_ACTION_DELAY(frame_ticks);
+
+    /* Stage 2 - both pairs walk the remaining travel together, proportionally.
+     * Every frame moves front AND hind by a small step, so the body rises as a
+     * whole instead of pivoting about the hind legs (that pivot is what tipped
+     * the dog onto its face). The hind legs cover less distance, so the front
+     * legs take a slightly larger step and both arrive at neutral together. */
+    int hind_left  = hind_total - hind_exit;              /* 70 */
+    int front_left = front_total;                         /* 109 */
+    const int hind_step  = 2;
+    const int front_step = 2;    /* hind arrives first, then the front legs settle */
+    while (hind_left > 0 || front_left > 0) {
+        if (hind_left > 0)  { hind_left  -= hind_step;  if (hind_left  < 0) hind_left  = 0; }
+        if (front_left > 0) { front_left -= front_step; if (front_left < 0) front_left = 0; }
+        servo_set_angle(SERVO_BL, bl_angle_neutral - hind_left);
+        servo_set_angle(SERVO_BR, br_angle_neutral + hind_left);
+        servo_set_angle(SERVO_FL, fl_angle_neutral + front_left);
+        servo_set_angle(SERVO_FR, fr_angle_neutral - front_left);
+        SERVOR_DOG_ACTION_DELAY(frame_ticks * 2);
     }
 
+    /* Stage 3 - settle every leg on the exact neutral value so a couple of
+     * degrees of accumulated drift cannot leave the body standing tilted. */
     dog_action_args_t neutral_args = {0};
     servo_dog_neutral(neutral_args);
 }

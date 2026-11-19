@@ -10,6 +10,10 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <vector>
+#include <functional>
+#include <string_view>
+#include <cstring>
+#include <math.h>
 
 #include "display/lcd_display.h"
 #include <esp_lcd_panel_vendor.h>
@@ -92,15 +96,87 @@ static const led_strip_rmt_config_t bsp_rmt_config = {
     }
 };
 
+namespace {
+
+// ---- Emotion -> light colour table --------------------------------------
+// The screen and the LEDs must tell the same story. A face that arrives from
+// the cloud (the server sends bare names like "angry") previously only changed
+// the animation, so the light stayed on whatever colour it last had.
+struct MoodColor { uint8_t r; uint8_t g; uint8_t b; };
+
+struct MoodMapEntry {
+    const char* emotion;
+    MoodColor rgb;
+};
+
+static const MoodMapEntry kEmotionPalette[] = {
+    { "happy",       {  20, 140,  40 } },
+    { "laughing",    {  20, 145,  60 } },
+    { "funny",       {  35, 150,  75 } },
+    { "loving",      {  95,  35, 105 } },   // soft violet
+    { "confident",   {  30, 130,  95 } },
+    { "delicious",   { 125,  70,  20 } },   // amber
+    { "silly",       {  60, 155,  90 } },
+    { "winking",     {  90, 125,  30 } },
+    { "relaxed",     {  26,  42,  22 } },
+    { "thinking",    {  26,  42,  22 } },
+    { "confused",    {  72,  32,  12 } },
+    { "embarrassed", { 115,  45,  25 } },
+    { "sad",         {   0,  16,  70 } },
+    { "crying",      {   0,  14,  85 } },
+    { "sleepy",      {   0,  12,  60 } },
+    { "angry",       { 105,   0,   0 } },
+    { "surprised",   { 125,  95,  20 } },
+    { "shocked",     { 125,  60,  20 } },
+    { "neutral",     {  14,  42,  22 } },
+};
+
+// Subclass of the stock emoji widget: it plays the animation exactly as before,
+// then hands the emotion name to a hook so the firmware can drive the LEDs.
+class MoodEmojiWidget : public anim::EmojiWidget {
+public:
+    using EmotionHook = std::function<void(const char*)>;
+
+    MoodEmojiWidget(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io)
+        : anim::EmojiWidget(panel, panel_io)
+    {
+    }
+
+    bool SetEmotion(const char* emotion) override
+    {
+        const bool ok = anim::EmojiWidget::SetEmotion(emotion);
+        if (hook_ != nullptr && emotion != nullptr) {
+            hook_(emotion);
+        }
+        return ok;
+    }
+
+    void SetEmotionHook(EmotionHook hook)
+    {
+        hook_ = std::move(hook);
+    }
+
+private:
+    EmotionHook hook_;
+};
+
+}  // namespace
+
 class EspHi : public WifiBoard {
 private:
     Button boot_button_;
     Button audio_wake_button_;
     Button move_wake_button_;
     anim::EmojiWidget* display_ = nullptr;
+    // Same object as display_, kept separately so the class can reach the
+    // emotion hook without a cast.
+    MoodEmojiWidget* mood_display_ = nullptr;
     bool web_server_initialized_ = false;
     led_strip_handle_t led_strip_;
     bool led_on_ = false;
+    MoodColor led_base_ = { 20, 140, 40 };   // colour the breathing effect fades around
+    esp_timer_handle_t breathe_timer_ = nullptr;
+    float breathe_phase_ = 0.0f;
     esp_timer_handle_t idle_anim_timer_ = nullptr;
     // Separate one-shot timer: after being woken from sleep the dog answers
     // first and only gets up a few seconds later, so it never jumps the instant
@@ -123,6 +199,9 @@ private:
     DogPose pose_ = DogPose::kStanding;
     int64_t idle_entered_us_ = 0;   // when the device last settled into idle
     int64_t rest_until_us_ = 0;     // how long to stay lying down before standing
+    int64_t sleep_entered_us_ = 0;  // silence window starts here
+    int64_t last_activity_us_ = 0;  // last time the owner interacted with it
+    bool lonely_shown_ = false;     // already did the "waiting for you" move
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -261,6 +340,86 @@ private:
         return ret;
     }
 
+    // Writes a colour and remembers it as the base the breathing effect fades
+    // around. Called for every mood change; the breathing timer then keeps
+    // modulating that base so the light looks alive instead of a fixed lamp.
+    void SetLedMood(MoodColor color)
+    {
+        led_base_ = color;
+        if (!mood_led_enabled_) {
+            return;
+        }
+        SetLedColor(color.r, color.g, color.b);
+        led_on_ = true;
+    }
+
+    static void BreatheTimerCallback(void* arg)
+    {
+        EspHi* self = static_cast<EspHi*>(arg);
+        if (self == nullptr || !self->mood_led_enabled_ || !self->led_on_) {
+            return;
+        }
+        // One full breath every ~44 steps of 80 ms, i.e. about 3.5 s, the pace a
+        // resting animal breathes at. 36 % .. 100 % brightness.
+        const float kStep = 0.1428f;   // 2*pi/44
+        self->breathe_phase_ += kStep;
+        if (self->breathe_phase_ > 6.28318f) {
+            self->breathe_phase_ -= 6.28318f;
+        }
+        const float wave = sinf(self->breathe_phase_);
+        const float level = 0.68f + 0.32f * wave;    // 0.36 .. 1.00
+        const uint8_t r = static_cast<uint8_t>(self->led_base_.r * level);
+        const uint8_t g = static_cast<uint8_t>(self->led_base_.g * level);
+        const uint8_t b = static_cast<uint8_t>(self->led_base_.b * level);
+        self->SetLedColor(r, g, b);
+    }
+
+    void StartBreatheTimer()
+    {
+        if (breathe_timer_ != nullptr) {
+            return;
+        }
+        esp_timer_create_args_t timer_args = {
+            .callback = &BreatheTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "led_breathe",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&timer_args, &breathe_timer_) != ESP_OK) {
+            breathe_timer_ = nullptr;
+            ESP_LOGE(TAG, "Failed to create LED breathing timer");
+            return;
+        }
+        esp_timer_start_periodic(breathe_timer_, 80 * 1000);
+    }
+
+    // A face that came from the server (or a voice command) has no explicit
+    // mood colour of its own, so look it up in the table and drive the LEDs.
+    void OnDisplayEmotion(const char* emotion)
+    {
+        if (emotion == nullptr || !mood_led_enabled_ || !led_on_) {
+            return;   // the owner switched the light off, respect that
+        }
+        for (const auto& entry : kEmotionPalette) {
+            if (strcmp(emotion, entry.emotion) == 0) {
+                SetLedMood(entry.rgb);
+                return;
+            }
+        }
+    }
+
+    static std::string_view PickRandomSound()
+    {
+        static const std::string_view sounds[] = {
+            Lang::Sounds::OGG_POPUP,
+            Lang::Sounds::OGG_SUCCESS,
+            Lang::Sounds::OGG_VIBRATION,
+        };
+        const size_t count = sizeof(sounds) / sizeof(sounds[0]);
+        return sounds[esp_random() % count];
+    }
+
     void InitializeIot()
     {
         ESP_LOGI(TAG, "Initialize Iot");
@@ -335,7 +494,15 @@ private:
         esp_lcd_panel_draw_bitmap(panel, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, black.data());
 
         ESP_LOGI(TAG, "Create emoji widget, panel: %p, panel_io: %p", panel, panel_io);
-        display_ = new anim::EmojiWidget(panel, panel_io);
+        mood_display_ = new MoodEmojiWidget(panel, panel_io);
+        display_ = mood_display_;
+        if (mood_display_ != nullptr) {
+            // Every face - local mood or cloud-sent emotion - goes through the
+            // light as well, so the body cannot quietly disagree with the screen.
+            mood_display_->SetEmotionHook([this](const char* emotion) {
+                OnDisplayEmotion(emotion);
+            });
+        }
 
 #if CONFIG_ESP_CONSOLE_NONE
         servo_dog_ctrl_config_t config = {
@@ -444,8 +611,7 @@ private:
 
         mcp_server.AddTool("self.light.turn_on", "打开灯", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
             mood_led_enabled_ = true;
-            SetLedColor(0xFF, 0xFF, 0xFF);
-            led_on_ = true;
+            SetLedMood({ 255, 255, 255 });
             return true;
         });
 
@@ -453,8 +619,8 @@ private:
             // Switching the light off also parks the automatic mood colours, so
             // the dog does not light itself up again two seconds later.
             mood_led_enabled_ = false;
-            SetLedColor(0x00, 0x00, 0x00);
             led_on_ = false;
+            SetLedColor(0x00, 0x00, 0x00);
             return true;
         });
 
@@ -468,8 +634,7 @@ private:
             int b = properties["b"].value<int>();
 
             mood_led_enabled_ = true;
-            led_on_ = true;
-            SetLedColor(r, g, b);
+            SetLedMood({ static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b) });
             return true;
         });
     }
@@ -495,10 +660,11 @@ private:
     static constexpr int64_t kRestHoldUs          = 30 * 1000 * 1000;   // stay lying ~30 s
     static constexpr int64_t kWakeStandDelayUs    = 3 * 1000 * 1000;    // answer first, stand 3 s later
     static constexpr int64_t kMoodBurstWindowUs   = 60 * 1000 * 1000;   // repeated wake-ups inside 1 min
+    static constexpr int64_t kSleepSilenceUs      = 12 * 1000 * 1000;   // ignore wake-ups right after dozing off
+    static constexpr int64_t kLonelyUs            = 30 * 60 * 1000LL * 1000;  // 30 min with nobody around
 
     // Small mood palette for the four WS2812 pixels. The dog carries its state
     // in the light as well as on the screen, the way a pet shows how it feels.
-    struct MoodColor { uint8_t r; uint8_t g; uint8_t b; };
     static constexpr MoodColor kMoodHappy {  20, 140,  40 };  // warm green
     static constexpr MoodColor kMoodWake  {  90,  90,  90 };  // bright grey flash
     static constexpr MoodColor kMoodSleep {   0,  12,  60 };  // dim blue
@@ -544,10 +710,7 @@ private:
         if (display_ != nullptr && emotion != nullptr) {
             display_->SetEmotion(emotion);
         }
-        if (mood_led_enabled_) {
-            SetLedColor(color.r, color.g, color.b);
-            led_on_ = true;
-        }
+        SetLedMood(color);
     }
 
     void StartWakeStandTimer() {
@@ -591,12 +754,28 @@ private:
         }
         auto& app = Application::GetInstance();
 
-        if (app.GetDeviceState() != kDeviceStateIdle) {
-            // Something woke the dog up: button, gesture, wake word, cloud.
-            if (self->pose_ != DogPose::kStanding) {
-                // Answer first, get up a few seconds later (scheduled inside).
-                app.Schedule([self]() { self->WakeUpResponse(); });
-            } else if (self->dog_action_busy_) {
+        const auto state = app.GetDeviceState();
+        if (state != kDeviceStateIdle) {
+            const int64_t now_us = esp_timer_get_time();
+            self->last_activity_us_ = now_us;
+            self->lonely_shown_ = false;
+
+            /* Only "the owner is actually talking to me" counts as a wake-up.
+             * Connecting and Listening are the two states that appear exclusively
+             * when the device is woken; Speaking / Notifying / Upgrading are
+             * produced by the dog itself (its own answer, its own alerts) and
+             * must not count. Judging on "anything but Idle" was exactly what
+             * made it hear its own "I'm going to sleep now" as a wake word. */
+            const bool owner_talking = (state == kDeviceStateConnecting) ||
+                                       (state == kDeviceStateListening);
+            if (owner_talking && self->pose_ != DogPose::kStanding) {
+                /* Silence window right after dozing off: the reply it gives to
+                 * "go to sleep" must not bring it back up. */
+                if (now_us - self->sleep_entered_us_ >= kSleepSilenceUs) {
+                    app.Schedule([self]() { self->WakeUpResponse(); });
+                }
+            } else if (state == kDeviceStateListening &&
+                       self->pose_ == DogPose::kStanding && self->dog_action_busy_) {
                 // It listens to its owner: a random action is cut short the
                 // moment somebody talks to it.
                 servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
@@ -660,15 +839,27 @@ private:
         const bool annoyed = wake_burst_ >= 3;
 
         if (pose_ == DogPose::kSleeping) {
-            SetMood(annoyed ? "sad" : "happy", annoyed ? kMoodSad : kMoodWake);
-            // A built-in cue instead of talking: the board cannot speak on its
-            // own, but it can answer with a short sound.
-            Application::GetInstance().PlaySound(annoyed
-                ? Lang::Sounds::OGG_EXCLAMATION : Lang::Sounds::OGG_POPUP);
-            ArmWakeStandTimer(kWakeStandDelayUs);
-            ESP_LOGI(TAG, "Woken while asleep (burst %u): answer now, stand in %llds",
-                     static_cast<unsigned>(wake_burst_),
-                     static_cast<long long>(kWakeStandDelayUs / 1000000));
+            if (wake_burst_ <= 1) {
+                /* First call: open the eyes and chirp once, but stay curled up.
+                 * A dog that leaps to its feet on the first syllable is not
+                 * believable, and at night it is plain annoying. */
+                SetMood("surprised", kMoodWake);
+                Application::GetInstance().PlaySound(PickRandomSound());
+                ESP_LOGI(TAG, "First call while asleep: eyes only, staying curled");
+            } else if (wake_burst_ == 2) {
+                /* Second call within a minute: that is a real request, get up. */
+                SetMood("happy", kMoodHappy);
+                Application::GetInstance().PlaySound(PickRandomSound());
+                ArmWakeStandTimer(kWakeStandDelayUs);
+                ESP_LOGI(TAG, "Second call while asleep: answer now, stand in %llds",
+                         static_cast<long long>(kWakeStandDelayUs / 1000000));
+            } else {
+                /* Third call inside the same window: it is being pestered. */
+                SetMood("angry", kMoodAngry);
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+                ArmWakeStandTimer(kWakeStandDelayUs);
+                ESP_LOGI(TAG, "Third call while asleep: annoyed, standing anyway");
+            }
         } else if (pose_ == DogPose::kResting) {
             pose_ = DogPose::kStanding;
             rest_until_us_ = 0;
@@ -714,6 +905,20 @@ private:
             return;
         }
 
+        // Nobody has spoken to it for half an hour: it gives one long sigh,
+        // looks down and lies down to wait, the way a real dog does by the door.
+        if (!lonely_shown_ && now - last_activity_us_ >= kLonelyUs) {
+            lonely_shown_ = true;
+            SetMood("sad", kMoodSad);
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+            servo_dog_ctrl_send(DOG_STATE_LAY_DOWN, NULL);
+            pose_ = DogPose::kResting;
+            rest_until_us_ = now + kRestHoldUs;
+            idle_tick_busy_ = false;
+            ESP_LOGI(TAG, "Nobody around for 30 min: lie down and wait");
+            return;
+        }
+
         // ~60% a light face, ~40% one complete action carrying its own mood.
         if (esp_random() % 10 < 6) {
             PlayRandomEmotion();
@@ -734,8 +939,14 @@ private:
         rest_until_us_ = 0;
         dog_action_busy_ = false;
         idle_entered_us_ = 0;
+        sleep_entered_us_ = esp_timer_get_time();
+        last_activity_us_ = sleep_entered_us_;
+        lonely_shown_ = false;
         SetMood("sleepy", kMoodSleep);
-        ESP_LOGI(TAG, "Sleep on request: legs retracted, still listening for the wake word");
+        // Exactly one short cue when curling up, picked at random so it never
+        // sounds like the same looped sample; then the dog stays quiet.
+        Application::GetInstance().PlaySound(PickRandomSound());
+        ESP_LOGI(TAG, "Sleep on request: legs retracted, quiet from now on");
     }
 
     void PlayRandomEmotion() {
@@ -757,6 +968,9 @@ private:
             { "thinking",  kMoodCalm  },
             { "confused",  kMoodCalm  },
             { "sleepy",    kMoodSleep },
+            { "angry",      kMoodAngry },          // red face, red light
+            { "embarrassed", { 115, 45, 25 } },
+            { "surprised",  { 125, 95, 20 } },
         };
         const int count = sizeof(faces) / sizeof(faces[0]);
         int idx = static_cast<int>(esp_random() % count);
@@ -797,6 +1011,10 @@ private:
         const ActionSpec& spec = actions[idx];
 
         SetMood(spec.emotion, spec.color);
+        // One short cue at the start of the movement, so a random action is
+        // a whole pet reaction (sound + face + light + body) instead of a
+        // silent mechanical shuffle.
+        Application::GetInstance().PlaySound(PickRandomSound());
 
         if (spec.repeat_count > 0) {
             dog_action_args_t args = {0};
@@ -831,6 +1049,8 @@ public:
         InitializeTools();
         StartIdleAnimTimer();
         StartWakeStandTimer();
+        StartBreatheTimer();
+        last_activity_us_ = esp_timer_get_time();
     }
 
     virtual AudioCodec* GetAudioCodec() override
