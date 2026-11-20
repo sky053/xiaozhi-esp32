@@ -186,9 +186,14 @@ private:
     volatile bool dog_action_busy_ = false;
     bool mood_led_enabled_ = true;      // follow the user's light on/off intent
     int64_t last_wake_us_ = 0;          // last time it reacted to being woken
-    uint8_t wake_burst_ = 0;            // repeated wake-ups in a short window
     int8_t last_emotion_idx_ = -1;
     int8_t last_action_idx_ = -1;
+    // Cue throttling: a sample that fires on every mood change used to sound
+    // like one continuous tone. One cue per window is enough for a pet.
+    int64_t last_cue_us_ = 0;
+    // The "go to sleep" cue is fired from a one-shot timer a second after the
+    // legs start curling, so it is not swallowed by the reply TTS.
+    esp_timer_handle_t sleep_cue_timer_ = nullptr;
 
     // ---- Pose state machine ---------------------------------------------
     // The servo component has three postures that do NOT return to neutral
@@ -360,14 +365,16 @@ private:
             return;
         }
         // One full breath every ~44 steps of 80 ms, i.e. about 3.5 s, the pace a
-        // resting animal breathes at. 36 % .. 100 % brightness.
+        // resting animal breathes at. 10 % .. 100 % brightness: the low end is
+        // deliberately faint so the dog glows in a dark room instead of acting
+        // as a lamp.
         const float kStep = 0.1428f;   // 2*pi/44
         self->breathe_phase_ += kStep;
         if (self->breathe_phase_ > 6.28318f) {
             self->breathe_phase_ -= 6.28318f;
         }
         const float wave = sinf(self->breathe_phase_);
-        const float level = 0.68f + 0.32f * wave;    // 0.36 .. 1.00
+        const float level = 0.55f + 0.45f * wave;    // 0.10 .. 1.00
         const uint8_t r = static_cast<uint8_t>(self->led_base_.r * level);
         const uint8_t g = static_cast<uint8_t>(self->led_base_.g * level);
         const uint8_t b = static_cast<uint8_t>(self->led_base_.b * level);
@@ -418,6 +425,49 @@ private:
         };
         const size_t count = sizeof(sounds) / sizeof(sounds[0]);
         return sounds[esp_random() % count];
+    }
+
+    /* One short cue, and never more than one per kCueCooldownUs. Every mood
+     * change used to fire a sample, so while the dog was being talked to the
+     * cues stacked up and the speaker sounded like one endless tone. A pet
+     * that chirps once every few seconds reads as alive; one that beeps
+     * continuously reads as broken. */
+    void PlayCue(std::string_view sound) {
+        const int64_t now = esp_timer_get_time();
+        if (last_cue_us_ != 0 && now - last_cue_us_ < kCueCooldownUs) {
+            return;
+        }
+        last_cue_us_ = now;
+        Application::GetInstance().PlaySound(sound);
+    }
+
+    /* The "go to sleep" cue must not compete with the spoken reply, and the
+     * reply for that intent arrives a moment after the command. Firing it from
+     * a one-shot timer a second later guarantees it is heard exactly once,
+     * after the TTS has finished, instead of being queued behind it and
+     * silently dropped. */
+    static void SleepCueCallback(void* arg) {
+        (void)arg;
+        Application::GetInstance().PlaySound(PickRandomSound());
+    }
+
+    void ScheduleSleepCue() {
+        if (sleep_cue_timer_ == nullptr) {
+            esp_timer_create_args_t timer_args = {
+                .callback = &SleepCueCallback,
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "sleep_cue",
+                .skip_unhandled_events = true,
+            };
+            if (esp_timer_create(&timer_args, &sleep_cue_timer_) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to create sleep cue timer");
+                sleep_cue_timer_ = nullptr;
+                return;
+            }
+        }
+        esp_timer_stop(sleep_cue_timer_);
+        esp_timer_start_once(sleep_cue_timer_, kSleepCueDelayUs);
     }
 
     void InitializeIot()
@@ -659,18 +709,21 @@ private:
     static constexpr uint32_t kIdleDelayJitterMs  = 6000;
     static constexpr int64_t kRestHoldUs          = 30 * 1000 * 1000;   // stay lying ~30 s
     static constexpr int64_t kWakeStandDelayUs    = 3 * 1000 * 1000;    // answer first, stand 3 s later
-    static constexpr int64_t kMoodBurstWindowUs   = 60 * 1000 * 1000;   // repeated wake-ups inside 1 min
-    static constexpr int64_t kSleepSilenceUs      = 12 * 1000 * 1000;   // ignore wake-ups right after dozing off
+    // Just long enough to cover the tail of its own "okay, sleeping now" reply,
+    // which used to be picked up as a wake word and pop it straight back up.
+    // 12 s also swallowed a genuine call made right after putting it to bed,
+    // which is why the owner could never tell whether the window worked at all.
+    static constexpr int64_t kSleepSilenceUs      = 5 * 1000 * 1000;
     static constexpr int64_t kLonelyUs            = 30 * 60 * 1000LL * 1000;  // 30 min with nobody around
+    static constexpr int64_t kCueCooldownUs       = 8 * 1000 * 1000;    // at most one cue per 8 s
+    static constexpr int64_t kSleepCueDelayUs     = 1800 * 1000;        // cue 1.8 s into the curl-up
 
     // Small mood palette for the four WS2812 pixels. The dog carries its state
     // in the light as well as on the screen, the way a pet shows how it feels.
     static constexpr MoodColor kMoodHappy {  20, 140,  40 };  // warm green
-    static constexpr MoodColor kMoodWake  {  90,  90,  90 };  // bright grey flash
     static constexpr MoodColor kMoodSleep {   0,  12,  60 };  // dim blue
     static constexpr MoodColor kMoodCalm  {  25,  40,  20 };  // low moss
     static constexpr MoodColor kMoodSad   {   0,  16,  70 };  // cold blue
-    static constexpr MoodColor kMoodAngry { 100,   0,   0 };  // red
 
     void ArmIdleTimer(int64_t delay_us) {
         if (idle_anim_timer_ == nullptr) {
@@ -814,12 +867,15 @@ private:
             return;
         }
         const char* was = (pose_ == DogPose::kSleeping) ? "sleeping" : "resting";
+        const bool from_curl = (pose_ == DogPose::kSleeping);
         pose_ = DogPose::kStanding;
         rest_until_us_ = 0;
-        // DOG_STATE_STAND walks every leg back frame by frame (~3.8 s). Using
-        // DOG_STATE_IDLE here is what snapped the legs straight and then cut
-        // the torque, so the dog never got back on its feet.
-        servo_dog_ctrl_send(DOG_STATE_STAND, NULL);
+        // DOG_STATE_STAND walks every leg back frame by frame and is written for
+        // the curled-up pose: it starts at the exact angles retract_legs() ends
+        // on. Feeding it a lying-down dog would first snap the legs to those
+        // curled angles, which looks like a twitch. From LAY_DOWN the legs are
+        // already close to neutral, so a plain re-centre is the honest move.
+        servo_dog_ctrl_send(from_curl ? DOG_STATE_STAND : DOG_STATE_IDLE, NULL);
         SetMood("happy", kMoodHappy);
         ESP_LOGI(TAG, "Stand up slowly: leaving %s posture", was);
     }
@@ -827,44 +883,26 @@ private:
     // Reacts the moment it is woken up: a face and a short cue first, the actual
     // unfold is armed for a few seconds later so it does not snap upright.
     void WakeUpResponse() {
-        const int64_t now = esp_timer_get_time();
-        if (last_wake_us_ != 0 && now - last_wake_us_ < kMoodBurstWindowUs) {
-            if (wake_burst_ < 255) {
-                wake_burst_++;
-            }
-        } else {
-            wake_burst_ = 1;
-        }
-        last_wake_us_ = now;
-        const bool annoyed = wake_burst_ >= 3;
+        last_wake_us_ = esp_timer_get_time();
 
         if (pose_ == DogPose::kSleeping) {
-            if (wake_burst_ <= 1) {
-                /* First call: open the eyes and chirp once, but stay curled up.
-                 * A dog that leaps to its feet on the first syllable is not
-                 * believable, and at night it is plain annoying. */
-                SetMood("surprised", kMoodWake);
-                Application::GetInstance().PlaySound(PickRandomSound());
-                ESP_LOGI(TAG, "First call while asleep: eyes only, staying curled");
-            } else if (wake_burst_ == 2) {
-                /* Second call within a minute: that is a real request, get up. */
-                SetMood("happy", kMoodHappy);
-                Application::GetInstance().PlaySound(PickRandomSound());
-                ArmWakeStandTimer(kWakeStandDelayUs);
-                ESP_LOGI(TAG, "Second call while asleep: answer now, stand in %llds",
-                         static_cast<long long>(kWakeStandDelayUs / 1000000));
-            } else {
-                /* Third call inside the same window: it is being pestered. */
-                SetMood("angry", kMoodAngry);
-                Application::GetInstance().PlaySound(Lang::Sounds::OGG_EXCLAMATION);
-                ArmWakeStandTimer(kWakeStandDelayUs);
-                ESP_LOGI(TAG, "Third call while asleep: annoyed, standing anyway");
-            }
+            /* One call is enough. Calling it a second or third time used to
+             * escalate to an annoyed red face plus an exclamation sample, and
+             * that fired on perfectly ordinary sequences (say "go to sleep",
+             * then test "hello xiaozhi"), which read as the dog sulking right
+             * after being put to bed. Now every wake-up is the same warm
+             * answer followed by a slow stand, however often it is called. */
+            SetMood("happy", kMoodHappy);
+            PlayCue(PickRandomSound());
+            ArmWakeStandTimer(kWakeStandDelayUs);
+            ESP_LOGI(TAG, "Woken while asleep: answering, standing in %llds",
+                     static_cast<long long>(kWakeStandDelayUs / 1000000));
         } else if (pose_ == DogPose::kResting) {
             pose_ = DogPose::kStanding;
             rest_until_us_ = 0;
             servo_dog_ctrl_send(DOG_STATE_IDLE, NULL);
-            SetMood(annoyed ? "sad" : "happy", annoyed ? kMoodSad : kMoodHappy);
+            SetMood("happy", kMoodHappy);
+            PlayCue(PickRandomSound());
             ESP_LOGI(TAG, "Woken while resting, back on its feet");
         }
     }
@@ -910,7 +948,7 @@ private:
         if (!lonely_shown_ && now - last_activity_us_ >= kLonelyUs) {
             lonely_shown_ = true;
             SetMood("sad", kMoodSad);
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+            PlayCue(Lang::Sounds::OGG_POPUP);
             servo_dog_ctrl_send(DOG_STATE_LAY_DOWN, NULL);
             pose_ = DogPose::kResting;
             rest_until_us_ = now + kRestHoldUs;
@@ -943,10 +981,11 @@ private:
         last_activity_us_ = sleep_entered_us_;
         lonely_shown_ = false;
         SetMood("sleepy", kMoodSleep);
-        // Exactly one short cue when curling up, picked at random so it never
-        // sounds like the same looped sample; then the dog stays quiet.
-        Application::GetInstance().PlaySound(PickRandomSound());
-        ESP_LOGI(TAG, "Sleep on request: legs retracted, quiet from now on");
+        // Exactly one short cue while the legs curl up, fired 1.8 s later from
+        // its own timer so the spoken "okay, sleeping now" reply cannot drown
+        // it out. After that the dog stays silent.
+        ScheduleSleepCue();
+        ESP_LOGI(TAG, "Sleep on request: legs retracting, one cue, then quiet");
     }
 
     void PlayRandomEmotion() {
@@ -968,7 +1007,6 @@ private:
             { "thinking",  kMoodCalm  },
             { "confused",  kMoodCalm  },
             { "sleepy",    kMoodSleep },
-            { "angry",      kMoodAngry },          // red face, red light
             { "embarrassed", { 115, 45, 25 } },
             { "surprised",  { 125, 95, 20 } },
         };
@@ -1013,8 +1051,8 @@ private:
         SetMood(spec.emotion, spec.color);
         // One short cue at the start of the movement, so a random action is
         // a whole pet reaction (sound + face + light + body) instead of a
-        // silent mechanical shuffle.
-        Application::GetInstance().PlaySound(PickRandomSound());
+        // silent mechanical shuffle. Throttled, so two cues never overlap.
+        PlayCue(PickRandomSound());
 
         if (spec.repeat_count > 0) {
             dog_action_args_t args = {0};

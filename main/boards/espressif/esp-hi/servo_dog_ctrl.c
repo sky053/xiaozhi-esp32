@@ -634,58 +634,77 @@ static void servo_dog_ledc_stop(void)
         gpio_set_level(g_servo_dog->br_gpio_num, 1);
     }
 }
-/* Slow unfold: servo_dog_retract_legs() played backwards, hind legs first so the
- * body never tips forward. args.speed is reused here as the per-frame delay in
- * milliseconds; at the table default (18) the whole unfold takes about 3.8 s,
- * slow enough for the servos to follow and it reads as a dog getting up rather
- * than a jump. */
+/* Slow unfold from the curled-up pose.
+ *
+ * The curled pose parks the front legs at 109 and the hind legs at 102, with
+ * the hind feet tucked below/inside the front ones. Two facts govern this:
+ *
+ *   1. The front legs must not be the only pair still folded while the body
+ *      leans forward, or the dog pivots about the hind feet and lands on its
+ *      nose. That means the front pair has to unfold at least as far as the
+ *      hind pair on every single frame, never less.
+ *   2. The hind legs must not be the ones doing all the moving while the front
+ *      feet are still in the air. An earlier version let the hind pair clear
+ *      that interference zone alone for 240 ms and that was exactly the
+ *      nose-dive the owner kept seeing.
+ *
+ * So both pairs move on every frame, and the front pair is kept a constant
+ * lead_pct ahead of the hind pair the whole way down. The sweep is split into
+ * two halves with a short pause: at the half-way point all four feet are down,
+ * the servos take the load without any momentum, and the second half finishes
+ * from a stable stance instead of one long accelerating swing.
+ *
+ * args.speed is reused here as the per-frame delay in milliseconds.
+ */
 static void servo_dog_stand(dog_action_args_t args)
 {
-    int frame_ms = (args.speed > 0) ? args.speed : 18;
-    if (frame_ms > 40) {
-        frame_ms = 40;
+    int frame_ms = (args.speed > 0) ? args.speed : 25;
+    if (frame_ms < 12) {
+        frame_ms = 12;
+    }
+    if (frame_ms > 60) {
+        frame_ms = 60;
     }
     int frame_ticks = frame_ms / portTICK_PERIOD_MS;
     if (frame_ticks < 1) {
         frame_ticks = 1;
     }
 
-    /* Stage 1 - the hind legs leave the interference zone first.
-     * In the curled pose the hind feet sit below/inside the front feet, so the
-     * front legs physically cannot swing back while the hind ones are still
-     * tucked in. Only the first ~31 % of the hind travel is covered here, which
-     * is mostly a sideways slide: it clears the way without lifting the rear of
-     * the body much, so the centre of gravity does not run forward yet. */
-    const int hind_total  = 102;
-    const int front_total = 109;
-    const int hind_exit   = 32;
-    for (int i = hind_total; i >= hind_total - hind_exit; i--) {
-        servo_set_angle(SERVO_BL, bl_angle_neutral - i);
-        servo_set_angle(SERVO_BR, br_angle_neutral + i);
+    const int front_start = 109;    /* angle the front legs are parked at */
+    const int hind_start  = 102;    /* angle the hind  legs are parked at */
+    const int lead_pct    = 12;     /* how far the front pair stays ahead */
+    const int stop_pct    = 55;     /* pause here, every foot already down */
+    const int sweep1      = 66;     /* frames, 0 -> stop_pct */
+    const int sweep2      = 54;     /* frames, stop_pct -> 100 */
+
+    int i, p, fp;
+    for (i = 1; i <= sweep1; i++) {
+        p  = stop_pct * i / sweep1;
+        fp = p + lead_pct;
+        if (fp > 100) fp = 100;
+        servo_set_angle(SERVO_BL, bl_angle_neutral - hind_start  * (100 - p)  / 100);
+        servo_set_angle(SERVO_BR, br_angle_neutral + hind_start  * (100 - p)  / 100);
+        servo_set_angle(SERVO_FL, fl_angle_neutral + front_start * (100 - fp) / 100);
+        servo_set_angle(SERVO_FR, fr_angle_neutral - front_start * (100 - fp) / 100);
         SERVOR_DOG_ACTION_DELAY(frame_ticks);
     }
 
-    /* Stage 2 - both pairs walk the remaining travel together, proportionally.
-     * Every frame moves front AND hind by a small step, so the body rises as a
-     * whole instead of pivoting about the hind legs (that pivot is what tipped
-     * the dog onto its face). The hind legs cover less distance, so the front
-     * legs take a slightly larger step and both arrive at neutral together. */
-    int hind_left  = hind_total - hind_exit;              /* 70 */
-    int front_left = front_total;                         /* 109 */
-    const int hind_step  = 2;
-    const int front_step = 2;    /* hind arrives first, then the front legs settle */
-    while (hind_left > 0 || front_left > 0) {
-        if (hind_left > 0)  { hind_left  -= hind_step;  if (hind_left  < 0) hind_left  = 0; }
-        if (front_left > 0) { front_left -= front_step; if (front_left < 0) front_left = 0; }
-        servo_set_angle(SERVO_BL, bl_angle_neutral - hind_left);
-        servo_set_angle(SERVO_BR, br_angle_neutral + hind_left);
-        servo_set_angle(SERVO_FL, fl_angle_neutral + front_left);
-        servo_set_angle(SERVO_FR, fr_angle_neutral - front_left);
-        SERVOR_DOG_ACTION_DELAY(frame_ticks * 2);
+    /* Let every leg carry its share of the weight before the second half. */
+    SERVOR_DOG_ACTION_DELAY(250 / portTICK_PERIOD_MS);
+
+    for (i = 1; i <= sweep2; i++) {
+        p  = stop_pct + (100 - stop_pct) * i / sweep2;
+        fp = p + lead_pct;
+        if (fp > 100) fp = 100;
+        servo_set_angle(SERVO_BL, bl_angle_neutral - hind_start  * (100 - p)  / 100);
+        servo_set_angle(SERVO_BR, br_angle_neutral + hind_start  * (100 - p)  / 100);
+        servo_set_angle(SERVO_FL, fl_angle_neutral + front_start * (100 - fp) / 100);
+        servo_set_angle(SERVO_FR, fr_angle_neutral - front_start * (100 - fp) / 100);
+        SERVOR_DOG_ACTION_DELAY(frame_ticks);
     }
 
-    /* Stage 3 - settle every leg on the exact neutral value so a couple of
-     * degrees of accumulated drift cannot leave the body standing tilted. */
+    /* Settle every leg on the exact neutral value so a couple of degrees of
+     * accumulated drift cannot leave the body standing tilted. */
     dog_action_args_t neutral_args = {0};
     servo_dog_neutral(neutral_args);
 }

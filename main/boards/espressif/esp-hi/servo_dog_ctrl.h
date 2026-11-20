@@ -65,9 +65,9 @@ typedef struct {
     /* Retract legs, all four legs move back to the starting position */ \
     X(DOG_STATE_RETRACT_LEGS, servo_dog_retract_legs, /* repeat_count */ NOT_USE, /* speed */ NOT_USE, /* hold_time_ms */ NOT_USE, /* angle_offset */ NOT_USE) \
     /* Stand up slowly from a retracted pose. Here speed is reused as the
-       per-frame delay in milliseconds, so the unfold is smooth instead of a
-       single jump that the servo cannot follow. */ \
-    X(DOG_STATE_STAND, servo_dog_stand, /* repeat_count */ NOT_USE, /* speed */ 18, /* hold_time_ms */ NOT_USE, /* angle_offset */ NOT_USE)
+       per-frame delay in milliseconds: 25 ms per frame gives ~3.3 s for the
+       two-sweep unfold, slow enough that the body settles instead of diving. */ \
+    X(DOG_STATE_STAND, servo_dog_stand, /* repeat_count */ NOT_USE, /* speed */ 25, /* hold_time_ms */ NOT_USE, /* angle_offset */ NOT_USE)
 
 typedef enum {
     #define X(a, b, c, d, e, f) a,
